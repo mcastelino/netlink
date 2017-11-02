@@ -784,7 +784,10 @@ func LinkAdd(link Link) error {
 
 // LinkAdd adds a new link device. The type and features of the device
 // are taken fromt the parameters in the link object.
-// Equivalent to: `ip link add $link`
+// Equivalent to: `ip link add $link`.
+// If link is of type *Tuntap and link.Queues != 0, LinkAdd will return
+// open file descriptors in link.Fds for each newly created interface.
+// It is the caller's responsibility to close these file descriptors.
 func (h *Handle) LinkAdd(link Link) error {
 	return h.linkModify(link, unix.NLM_F_CREATE|unix.NLM_F_EXCL|unix.NLM_F_ACK)
 }
@@ -812,37 +815,39 @@ func (h *Handle) linkModify(link Link, flags int) error {
 		}
 		tuntap.Fds = nil
 
+		var req ifReq
+		if queues > 1 {
+			req.Flags = uint16(TUNTAP_MULTI_QUEUE_DEFAULTS)
+		} else {
+			if tuntap.Flags == 0 {
+				req.Flags = uint16(TUNTAP_DEFAULTS)
+			} else {
+				req.Flags = uint16(tuntap.Flags)
+			}
+		}
+
+		copy(req.Name[:15], base.Name)
+		req.Flags |= unix.IFF_NO_PI
+		req.Flags |= uint16(tuntap.Mode)
+
+		var fds []*os.File
 		for i := 0; i < queues; i++ {
 			file, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
 			if err != nil {
-				cleanupFds(tuntap.Fds[:i])
+				cleanupFds(fds)
 				return err
 			}
-			var req ifReq
-			copy(req.Name[:15], base.Name)
-
-			if tuntap.Queues > 1 {
-				req.Flags = uint16(TUNTAP_MULTI_QUEUE_DEFAULTS)
-			} else {
-				if tuntap.Flags == 0 {
-					req.Flags = uint16(TUNTAP_DEFAULTS)
-				} else {
-					req.Flags = uint16(tuntap.Flags)
-				}
-			}
-			req.Flags |= uint16(tuntap.Mode)
-
-			tuntap.Fds = append(tuntap.Fds, file)
+			fds = append(fds, file)
 			_, _, errno := unix.Syscall(unix.SYS_IOCTL, file.Fd(), uintptr(unix.TUNSETIFF), uintptr(unsafe.Pointer(&req)))
 			if errno != 0 {
-				cleanupFds(tuntap.Fds[:i])
+				cleanupFds(fds)
 				return fmt.Errorf("Tuntap IOCTL TUNSETIFF failed [%d], errno %v", i, errno)
 			}
-			_, _, errno = unix.Syscall(unix.SYS_IOCTL, file.Fd(), uintptr(unix.TUNSETPERSIST), 1)
-			if errno != 0 {
-				cleanupFds(tuntap.Fds[:i])
-				return fmt.Errorf("Tuntap IOCTL TUNSETPERSIST failed [%d], errno %v", i, errno)
-			}
+		}
+		_, _, errno := unix.Syscall(unix.SYS_IOCTL, fds[0].Fd(), uintptr(unix.TUNSETPERSIST), 1)
+		if errno != 0 {
+			cleanupFds(fds)
+			return fmt.Errorf("Tuntap IOCTL TUNSETPERSIST failed, errno %v", errno)
 		}
 
 		h.ensureIndex(base)
@@ -850,12 +855,21 @@ func (h *Handle) linkModify(link Link, flags int) error {
 		// can't set master during create, so set it afterwards
 		if base.MasterIndex != 0 {
 			// TODO: verify MasterIndex is actually a bridge?
-			return h.LinkSetMasterByIndex(link, base.MasterIndex)
+			err := h.LinkSetMasterByIndex(link, base.MasterIndex)
+			if err != nil {
+				cleanupFds(fds)
+				_, _, _ = syscall.Syscall(unix.SYS_IOCTL, fds[0].Fd(),
+					uintptr(syscall.TUNSETPERSIST), 0)
+				return err
+			}
 		}
 
 		if tuntap.Queues == 0 {
-			cleanupFds(tuntap.Fds)
+			cleanupFds(fds)
+		} else {
+			tuntap.Fds = fds
 		}
+
 		return nil
 	}
 
